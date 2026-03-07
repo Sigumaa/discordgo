@@ -26,98 +26,65 @@ Gophers](https://discord.gg/golang) chat server.**
 
 ## Getting Started
 
-### Installing
+This library uses CGo to link against [libdave](https://github.com/discord/libdave) for [DAVE protocol](https://daveprotocol.com/) (Discord Audio & Video E2EE) support. A C++ toolchain is required.
 
-This assumes you already have a working Go environment, if not please see
-[this page](https://golang.org/doc/install) first.
+> **Note:** `go get` alone is not sufficient. You must clone this repository and build libdave first.
 
-`go get` *will always pull the latest tagged release from the master branch.*
-
-```sh
-go get github.com/bwmarrin/discordgo
-```
-
-### Usage
-
-Import the package into your project.
-
-```go
-import "github.com/bwmarrin/discordgo"
-```
-
-Construct a new Discord client which can be used to access the variety of 
-Discord API functions and to set callback functions for Discord events.
-
-```go
-discord, err := discordgo.New("Bot " + "authentication token")
-```
-
-See Documentation and Examples below for more detailed information.
-
-
-## DAVE (Voice E2EE) Support
-
-This fork includes support for the [DAVE protocol](https://daveprotocol.com/) (Discord Audio & Video End-to-End Encryption). DAVE adds frame-level E2EE on top of the existing transport encryption.
-
-### Prerequisites
-
-DAVE requires [libdave](https://github.com/discord/libdave) (Discord's official C++ library) to be built and available at link time. The following tools are needed:
-
-- **Go 1.21+**
-- **C/C++ compiler** (Clang or GCC)
-- **CMake 3.16+**
-- **Git**
-- **pkg-config**
+### 1. Install prerequisites
 
 **macOS:**
 ```sh
-brew install cmake pkg-config
+brew install go cmake pkg-config
 ```
 
 **Debian / Ubuntu:**
 ```sh
-sudo apt-get install build-essential cmake pkg-config git curl zip unzip tar
+sudo apt-get install golang build-essential cmake pkg-config git curl zip unzip tar
 ```
 
 **Fedora / RHEL:**
 ```sh
-sudo dnf install gcc-c++ cmake pkgconf git
+sudo dnf install golang gcc-c++ cmake pkgconf git
 ```
 
-### Setup (recommended)
-
-A setup script is provided that handles cloning, building, and installing libdave automatically:
+### 2. Clone and build
 
 ```sh
+git clone https://github.com/sh1ma/discordgo.git
+cd discordgo
+
+# Build libdave and install dependencies (clones discord/libdave automatically)
 ./scripts/setup-dave.sh
 ```
 
-This will:
+The script will:
 1. Clone [discord/libdave](https://github.com/discord/libdave) into `.libdave/`
-2. Build it with vcpkg dependencies (OpenSSL 3.x by default)
-3. Copy all headers and static libraries into `dave/deps/`
+2. Build it with vcpkg (OpenSSL 3.x by default)
+3. Copy headers and static libraries into `dave/deps/`
 
-After completion, standard Go commands work:
+Verify the build:
 ```sh
 go build ./...
 go test ./...
 ```
 
-#### Script options
+<details>
+<summary>Script options</summary>
 
 ```sh
-# Use a different SSL variant
+# Use a different SSL variant (openssl_3 | openssl_1.1 | boringssl)
 ./scripts/setup-dave.sh --ssl boringssl
 
-# Use an existing libdave checkout
+# Use an already cloned libdave
 ./scripts/setup-dave.sh --libdave-dir /path/to/libdave
 ```
+</details>
 
-### Manual setup
-
-If you prefer to set up manually:
+<details>
+<summary>Manual setup (without the script)</summary>
 
 ```sh
+# Clone and build libdave
 git clone https://github.com/discord/libdave.git
 cd libdave
 git submodule update --init --recursive
@@ -125,27 +92,37 @@ cd cpp
 ./vcpkg/bootstrap-vcpkg.sh
 make all SSL=openssl_3 BUILD_TYPE=Release
 make install SSL=openssl_3 BUILD_TYPE=Release
-```
 
-Then copy the build artifacts into `dave/deps/`:
-
-```sh
+# Copy artifacts into discordgo/dave/deps/
+# Replace <triplet> with your platform (arm64-osx, x64-linux, etc.)
 mkdir -p /path/to/discordgo/dave/deps/{include,lib}
-
-# Headers
 cp -r cpp/build/install/include/dave /path/to/discordgo/dave/deps/include/
-
-# Libraries (adjust triplet for your platform: arm64-osx, x64-linux, etc.)
 cp cpp/build/install/lib/libdave.a /path/to/discordgo/dave/deps/lib/
 cp cpp/build/vcpkg_installed/<triplet>/lib/lib{mlspp,mls_vectors,mls_ds,bytes,tls_syntax,hpke,ssl,crypto}.a \
    /path/to/discordgo/dave/deps/lib/
 ```
+</details>
 
-### Usage
+### 3. Use in your project
+
+In your bot's `go.mod`, add a `replace` directive pointing to your local clone:
+
+```
+require github.com/bwmarrin/discordgo v0.28.1
+
+replace github.com/bwmarrin/discordgo => /path/to/discordgo
+```
+
+Then in your code:
 
 ```go
-// Join a voice channel with DAVE E2EE enabled
-vc, err := session.ChannelVoiceJoinE2EE(guildID, channelID, false, false)
+import "github.com/bwmarrin/discordgo"
+
+// Create session
+discord, err := discordgo.New("Bot " + token)
+
+// Join voice with DAVE E2EE
+vc, err := discord.ChannelVoiceJoinE2EE(guildID, channelID, false, false)
 ```
 
 The DAVE handshake (MLS key exchange via voice opcodes 22/23/24) is handled automatically. When DAVE is not negotiated by the server, the connection falls back to standard transport encryption seamlessly.
