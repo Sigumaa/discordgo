@@ -757,6 +757,51 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 	return
 }
 
+// ChannelVoiceJoinE2EE joins the session user to a voice channel with DAVE E2EE enabled.
+//
+//    gID     : Guild ID of the channel to join.
+//    cID     : Channel ID of the channel to join.
+//    mute    : If true, you will be set to muted upon joining.
+//    deaf    : If true, you will be set to deafened upon joining.
+func (s *Session) ChannelVoiceJoinE2EE(gID, cID string, mute, deaf bool) (voice *VoiceConnection, err error) {
+
+	s.log(LogInformational, "called")
+
+	s.RLock()
+	voice, _ = s.VoiceConnections[gID]
+	s.RUnlock()
+
+	if voice == nil {
+		voice = &VoiceConnection{}
+		s.Lock()
+		s.VoiceConnections[gID] = voice
+		s.Unlock()
+	}
+
+	voice.Lock()
+	voice.GuildID = gID
+	voice.ChannelID = cID
+	voice.deaf = deaf
+	voice.mute = mute
+	voice.session = s
+	voice.daveEnabled = true
+	voice.Unlock()
+
+	err = s.ChannelVoiceJoinManual(gID, cID, mute, deaf)
+	if err != nil {
+		return
+	}
+
+	err = voice.waitUntilConnected()
+	if err != nil {
+		s.log(LogWarning, "error waiting for voice to connect, %s", err)
+		voice.Close()
+		return
+	}
+
+	return
+}
+
 // ChannelVoiceJoinManual initiates a voice session to a voice channel, but does not complete it.
 //
 // This should only be used when the VoiceServerUpdate will be intercepted and used elsewhere.

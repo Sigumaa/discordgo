@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bwmarrin/discordgo/dave"
 	"github.com/gorilla/websocket"
 )
 
@@ -71,6 +72,11 @@ type VoiceConnection struct {
 	op2 voiceOP2
 
 	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
+
+	// DAVE E2EE fields
+	daveSession      *dave.DAVESession
+	daveEnabled      bool
+	daveProtoVersion uint16
 }
 
 // VoiceSpeakingUpdateHandler type provides a function definition for the
@@ -175,6 +181,11 @@ func (v *VoiceConnection) Close() {
 
 	v.Ready = false
 	v.speaking = false
+
+	if v.daveSession != nil {
+		v.daveSession.Close()
+		v.daveSession = nil
+	}
 
 	if v.close != nil {
 		v.log(LogInformational, "closing v.close")
@@ -320,16 +331,26 @@ func (v *VoiceConnection) open() (err error) {
 	}
 
 	type voiceHandshakeData struct {
-		ServerID  string `json:"server_id"`
-		UserID    string `json:"user_id"`
-		SessionID string `json:"session_id"`
-		Token     string `json:"token"`
+		ServerID               string `json:"server_id"`
+		UserID                 string `json:"user_id"`
+		SessionID              string `json:"session_id"`
+		Token                  string `json:"token"`
+		MaxDaveProtocolVersion uint16 `json:"max_dave_protocol_version,omitempty"`
 	}
 	type voiceHandshakeOp struct {
 		Op   int                `json:"op"` // Always 0
 		Data voiceHandshakeData `json:"d"`
 	}
-	data := voiceHandshakeOp{0, voiceHandshakeData{v.GuildID, v.UserID, v.sessionID, v.token}}
+	handshake := voiceHandshakeData{
+		ServerID:  v.GuildID,
+		UserID:    v.UserID,
+		SessionID: v.sessionID,
+		Token:     v.token,
+	}
+	if v.daveEnabled {
+		handshake.MaxDaveProtocolVersion = dave.MaxSupportedProtocolVersion()
+	}
+	data := voiceHandshakeOp{0, handshake}
 
 	v.wsMutex.Lock()
 	err = v.wsConn.WriteJSON(data)
@@ -492,6 +513,29 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		block, _ := aes.NewCipher(v.op4.SecretKey[:])
 		v.aead, _ = cipher.NewGCM(block)
 
+		// Check for DAVE protocol version in OP4 response
+		if v.daveEnabled {
+			var daveOP4 struct {
+				DaveProtocolVersion uint16 `json:"dave_protocol_version"`
+			}
+			if err := json.Unmarshal(e.RawData, &daveOP4); err == nil && daveOP4.DaveProtocolVersion > 0 {
+				v.daveProtoVersion = daveOP4.DaveProtocolVersion
+				v.log(LogInformational, "DAVE protocol version %d negotiated", v.daveProtoVersion)
+
+				if v.daveSession == nil {
+					ds, err := dave.NewDAVESession(v.sessionID, v.UserID)
+					if err != nil {
+						v.log(LogError, "failed to create DAVE session: %s", err)
+					} else {
+						v.daveSession = ds
+						// Parse GuildID as uint64 for group ID
+						gid, _ := strconv.ParseUint(v.GuildID, 10, 64)
+						v.daveSession.Init(v.daveProtoVersion, gid)
+					}
+				}
+			}
+		}
+
 		return
 
 	case 5:
@@ -508,6 +552,37 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		for _, h := range v.voiceSpeakingUpdateHandlers {
 			h(v, voiceSpeakingUpdate)
 		}
+
+	case 22: // DAVE MLS Execute Transition
+		if v.daveSession == nil {
+			return
+		}
+		result, err := v.daveSession.HandleExecuteTransition(e.RawData)
+		if err != nil {
+			v.log(LogError, "DAVE execute transition error: %s", err)
+			return
+		}
+		// Send opcode 23 (transition ready) response
+		type daveTransitionReadyOp struct {
+			Op   int                     `json:"op"`
+			Data *dave.TransitionResult  `json:"d"`
+		}
+		v.wsMutex.Lock()
+		err = v.wsConn.WriteJSON(daveTransitionReadyOp{23, result})
+		v.wsMutex.Unlock()
+		if err != nil {
+			v.log(LogError, "error sending DAVE transition ready: %s", err)
+		}
+		return
+
+	case 24: // DAVE Prepare Epoch
+		if v.daveSession == nil {
+			return
+		}
+		if err := v.daveSession.HandlePrepareEpoch(e.RawData); err != nil {
+			v.log(LogError, "DAVE prepare epoch error: %s", err)
+		}
+		return
 
 	default:
 		v.log(LogDebug, "unknown voice operation, %d, %s", e.Operation, string(e.RawData))
@@ -772,6 +847,16 @@ func (v *VoiceConnection) opusSender(udpConn *net.UDPConn, close <-chan struct{}
 		binary.BigEndian.PutUint16(udpHeader[2:], sequence)
 		binary.BigEndian.PutUint32(udpHeader[4:], timestamp)
 
+		// DAVE E2EE: encrypt opus frame before transport encryption
+		if v.daveSession != nil {
+			var daveErr error
+			recvbuf, daveErr = v.daveSession.EncryptOpusFrame(v.op2.SSRC, recvbuf)
+			if daveErr != nil {
+				v.log(LogError, "DAVE encrypt error: %s", daveErr)
+				continue
+			}
+		}
+
 		// encrypt the opus data
 		// add incrementing nonce counter as per discord's requirements
 		binary.LittleEndian.PutUint32(nonce[:4], v.nonceCounter)
@@ -922,6 +1007,18 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 				}
 				plain = plain[extPayloadBytes:]
 			}
+
+			// DAVE E2EE: decrypt after transport decryption
+			if v.daveSession != nil {
+				v.daveSession.GetOrCreateDecryptor(p.SSRC)
+				decrypted, daveErr := v.daveSession.DecryptOpusFrame(p.SSRC, plain)
+				if daveErr != nil {
+					v.log(LogDebug, "DAVE decrypt error for SSRC %d: %s", p.SSRC, daveErr)
+					continue
+				}
+				plain = decrypted
+			}
+
 			p.Opus = plain
 		} else {
 			continue
