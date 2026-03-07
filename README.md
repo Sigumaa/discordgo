@@ -55,6 +55,59 @@ discord, err := discordgo.New("Bot " + "authentication token")
 See Documentation and Examples below for more detailed information.
 
 
+## DAVE (Voice E2EE) Support
+
+This fork includes support for the [DAVE protocol](https://daveprotocol.com/) (Discord Audio & Video End-to-End Encryption). DAVE adds frame-level E2EE on top of the existing transport encryption.
+
+### Prerequisites
+
+DAVE requires [libdave](https://github.com/discord/libdave) (Discord's official C++ library) to be built and available at link time. The following tools are needed:
+
+- **Go 1.21+**
+- **C/C++ compiler** (Clang or GCC)
+- **CMake 3.16+**
+- **Git** (for cloning and submodule init)
+- **pkg-config** (`brew install pkg-config` on macOS)
+
+### Building libdave
+
+Clone and build libdave **next to** your discordgo directory (the CGo flags expect `../libdave` relative to the discordgo root):
+
+```sh
+# From the parent directory of discordgo
+git clone https://github.com/discord/libdave.git
+cd libdave
+git submodule update --init --recursive
+
+# Bootstrap vcpkg (bundled as a submodule)
+cd cpp
+./vcpkg/bootstrap-vcpkg.sh
+
+# Build (OpenSSL 3.x variant)
+make all SSL=openssl_3 BUILD_TYPE=Release
+
+# Install headers and static library
+make install SSL=openssl_3 BUILD_TYPE=Release
+```
+
+After this, you should have:
+```
+libdave/cpp/build/install/lib/libdave.a
+libdave/cpp/build/install/include/dave/dave.h
+libdave/cpp/build/vcpkg_installed/arm64-osx/lib/  (mlspp, ssl, crypto, etc.)
+```
+
+> **Note:** The vcpkg triplet directory name varies by platform (e.g., `arm64-osx`, `x64-linux`). If you are not on Apple Silicon macOS, update the `#cgo LDFLAGS` path in `dave/libdave.go` accordingly.
+
+### Usage
+
+```go
+// Join a voice channel with DAVE E2EE enabled
+vc, err := session.ChannelVoiceJoinE2EE(guildID, channelID, false, false)
+```
+
+The DAVE handshake (MLS key exchange via voice opcodes 22/23/24) is handled automatically. When DAVE is not negotiated by the server, the connection falls back to standard transport encryption seamlessly.
+
 ## Documentation
 
 **NOTICE**: This library and the Discord API are unfinished.
