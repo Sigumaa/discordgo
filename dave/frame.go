@@ -18,6 +18,16 @@ const (
 	DefaultTransitionExpiryMs = 10000 // 10 seconds
 )
 
+// DAVE voice gateway binary opcodes
+const (
+	BinaryOpcodeExternalSender  = 25
+	BinaryOpcodeKeyPackage      = 26
+	BinaryOpcodeProposals       = 27
+	BinaryOpcodeCommitWelcome   = 28
+	BinaryOpcodeAnnounceCommit  = 29
+	BinaryOpcodeWelcome         = 30
+)
+
 // CommitResultType represents the result of processing an MLS commit.
 type CommitResultType int
 

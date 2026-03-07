@@ -77,6 +77,7 @@ type VoiceConnection struct {
 	daveSession      *dave.DAVESession
 	daveEnabled      bool
 	daveProtoVersion uint16
+	daveTransitionID uint16
 }
 
 // VoiceSpeakingUpdateHandler type provides a function definition for the
@@ -377,7 +378,7 @@ func (v *VoiceConnection) wsListen(wsConn *websocket.Conn, close <-chan struct{}
 	v.log(LogInformational, "called")
 
 	for {
-		_, message, err := v.wsConn.ReadMessage()
+		msgType, message, err := v.wsConn.ReadMessage()
 		if err != nil {
 			// 4014 indicates a manual disconnection by someone in the guild;
 			// we shouldn't reconnect.
@@ -438,7 +439,11 @@ func (v *VoiceConnection) wsListen(wsConn *websocket.Conn, close <-chan struct{}
 		case <-close:
 			return
 		default:
-			go v.onEvent(message)
+			if msgType == websocket.BinaryMessage {
+				go v.onDaveBinaryEvent(message)
+			} else {
+				go v.onEvent(message)
+			}
 		}
 	}
 }
@@ -539,19 +544,38 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		return
 
 	case 5:
-		if len(v.voiceSpeakingUpdateHandlers) == 0 {
-			return
-		}
-
 		voiceSpeakingUpdate := &VoiceSpeakingUpdate{}
 		if err := json.Unmarshal(e.RawData, voiceSpeakingUpdate); err != nil {
 			v.log(LogError, "OP5 unmarshall error, %s, %s", err, string(e.RawData))
 			return
 		}
 
+		// Register SSRC→userID mapping for DAVE decryptor key assignment
+		if v.daveSession != nil && voiceSpeakingUpdate.SSRC != 0 && voiceSpeakingUpdate.UserID != "" {
+			v.daveSession.RegisterSSRC(uint32(voiceSpeakingUpdate.SSRC), voiceSpeakingUpdate.UserID)
+		}
+
 		for _, h := range v.voiceSpeakingUpdateHandlers {
 			h(v, voiceSpeakingUpdate)
 		}
+
+	case 21: // DAVE MLS Prepare Transition
+		if v.daveSession == nil {
+			return
+		}
+		var d struct {
+			TransitionID    uint16 `json:"transition_id"`
+			ProtocolVersion uint16 `json:"protocol_version"`
+		}
+		if err := json.Unmarshal(e.RawData, &d); err != nil {
+			v.log(LogError, "OP21 unmarshall error: %s", err)
+			return
+		}
+		v.log(LogInformational, "DAVE prepare transition: id=%d proto=%d", d.TransitionID, d.ProtocolVersion)
+		v.Lock()
+		v.daveTransitionID = d.TransitionID
+		v.Unlock()
+		return
 
 	case 22: // DAVE MLS Execute Transition
 		if v.daveSession == nil {
@@ -562,17 +586,7 @@ func (v *VoiceConnection) onEvent(message []byte) {
 			v.log(LogError, "DAVE execute transition error: %s", err)
 			return
 		}
-		// Send opcode 23 (transition ready) response
-		type daveTransitionReadyOp struct {
-			Op   int                     `json:"op"`
-			Data *dave.TransitionResult  `json:"d"`
-		}
-		v.wsMutex.Lock()
-		err = v.wsConn.WriteJSON(daveTransitionReadyOp{23, result})
-		v.wsMutex.Unlock()
-		if err != nil {
-			v.log(LogError, "error sending DAVE transition ready: %s", err)
-		}
+		v.log(LogInformational, "DAVE execute transition: id=%d, sender keys activated", result.TransitionID)
 		return
 
 	case 24: // DAVE Prepare Epoch
@@ -589,6 +603,135 @@ func (v *VoiceConnection) onEvent(message []byte) {
 	}
 
 	return
+}
+
+// onDaveBinaryEvent handles binary websocket messages for DAVE MLS protocol.
+// Server-to-client binary frames may use either:
+//   - [uint8 opcode][payload] — observed in practice
+//   - [uint16 seq][uint8 opcode][payload] — per protocol spec
+//
+// We detect the format by checking if byte 0 is a known DAVE opcode (25-30).
+func (v *VoiceConnection) onDaveBinaryEvent(message []byte) {
+	if len(message) < 1 {
+		return
+	}
+
+	if v.daveSession == nil {
+		v.log(LogWarning, "received DAVE binary message but no DAVE session")
+		return
+	}
+
+	var opcode byte
+	var payload []byte
+
+	// Detect binary frame format
+	if message[0] >= dave.BinaryOpcodeExternalSender && message[0] <= dave.BinaryOpcodeWelcome {
+		// Format: [opcode][payload]
+		opcode = message[0]
+		payload = message[1:]
+	} else if len(message) >= 3 && message[2] >= dave.BinaryOpcodeExternalSender && message[2] <= dave.BinaryOpcodeWelcome {
+		// Format: [seq(2)][opcode][payload]
+		opcode = message[2]
+		payload = message[3:]
+	} else {
+		v.log(LogWarning, "DAVE: unrecognized binary frame (first bytes: %x)", message[:min(4, len(message))])
+		return
+	}
+
+	v.log(LogDebug, "DAVE binary opcode %d, payload length %d", opcode, len(payload))
+
+	switch opcode {
+	case dave.BinaryOpcodeExternalSender: // 25
+		v.log(LogInformational, "DAVE: received external sender (%d bytes)", len(payload))
+		keyPackage, err := v.daveSession.HandleExternalSender(payload)
+		if err != nil {
+			v.log(LogError, "DAVE external sender error: %s", err)
+			return
+		}
+		if err := v.sendDaveBinary(dave.BinaryOpcodeKeyPackage, keyPackage); err != nil {
+			v.log(LogError, "DAVE: error sending key package: %s", err)
+		} else {
+			v.log(LogInformational, "DAVE: sent key package (%d bytes)", len(keyPackage))
+		}
+
+	case dave.BinaryOpcodeProposals: // 27
+		v.log(LogInformational, "DAVE: received proposals (%d bytes)", len(payload))
+		commitWelcome, err := v.daveSession.HandleProposalsBinary(payload)
+		if err != nil {
+			v.log(LogError, "DAVE proposals error: %s", err)
+			return
+		}
+		if len(commitWelcome) > 0 {
+			if err := v.sendDaveBinary(dave.BinaryOpcodeCommitWelcome, commitWelcome); err != nil {
+				v.log(LogError, "DAVE: error sending commit+welcome: %s", err)
+			} else {
+				v.log(LogInformational, "DAVE: sent commit+welcome (%d bytes)", len(commitWelcome))
+			}
+			// Committer: send transition ready after generating commit
+			v.RLock()
+			tid := v.daveTransitionID
+			v.RUnlock()
+			v.sendDaveTransitionReady(tid)
+		}
+
+	case dave.BinaryOpcodeAnnounceCommit: // 29
+		v.log(LogInformational, "DAVE: received announce commit (%d bytes)", len(payload))
+		transitionID, err := v.daveSession.HandleCommitBinary(payload)
+		if err != nil {
+			v.log(LogError, "DAVE commit error: %s", err)
+			return
+		}
+		// After processing commit, send transition ready
+		v.sendDaveTransitionReady(transitionID)
+
+	case dave.BinaryOpcodeWelcome: // 30
+		v.log(LogInformational, "DAVE: received welcome (%d bytes)", len(payload))
+		transitionID, err := v.daveSession.HandleWelcomeBinary(payload)
+		if err != nil {
+			v.log(LogError, "DAVE welcome error: %s", err)
+			return
+		}
+		// After processing welcome, send transition ready
+		v.sendDaveTransitionReady(transitionID)
+
+	case dave.BinaryOpcodeCommitWelcome: // 28 (shouldn't normally be received by client)
+		v.log(LogWarning, "DAVE: received unexpected commit_welcome opcode 28 (%d bytes)", len(payload))
+
+	default:
+		v.log(LogWarning, "DAVE: unknown binary opcode %d", opcode)
+	}
+}
+
+// sendDaveTransitionReady sends voice opcode 23 (transition ready) to the server.
+func (v *VoiceConnection) sendDaveTransitionReady(transitionID uint16) {
+	type daveTransitionReadyOp struct {
+		Op   int                    `json:"op"`
+		Data *dave.TransitionResult `json:"d"`
+	}
+	result := &dave.TransitionResult{TransitionID: transitionID}
+	v.wsMutex.Lock()
+	err := v.wsConn.WriteJSON(daveTransitionReadyOp{23, result})
+	v.wsMutex.Unlock()
+	if err != nil {
+		v.log(LogError, "error sending DAVE transition ready: %s", err)
+	} else {
+		v.log(LogInformational, "DAVE: sent transition ready (id=%d)", transitionID)
+	}
+}
+
+// sendDaveBinary sends a DAVE binary message over the voice websocket.
+func (v *VoiceConnection) sendDaveBinary(opcode byte, data []byte) error {
+	msg := make([]byte, 1+len(data))
+	msg[0] = opcode
+	copy(msg[1:], data)
+
+	v.wsMutex.Lock()
+	defer v.wsMutex.Unlock()
+
+	if v.wsConn == nil {
+		return fmt.Errorf("no voice websocket connection")
+	}
+	return v.wsConn.WriteMessage(websocket.BinaryMessage, msg)
 }
 
 type voiceHeartbeatOp struct {

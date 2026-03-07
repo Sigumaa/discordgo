@@ -113,11 +113,11 @@ fi
 
 # --- Build libdave ---
 LIBDAVE_CPP="$LIBDAVE_DIR/cpp"
-echo "==> Building libdave (SSL=$SSL_VARIANT, BUILD_TYPE=Release)"
-make -C "$LIBDAVE_CPP" all SSL="$SSL_VARIANT" BUILD_TYPE=Release
+echo "==> Building libdave (SSL=$SSL_VARIANT, BUILD_TYPE=Release, PERSISTENT_KEYS=ON)"
+make -C "$LIBDAVE_CPP" all SSL="$SSL_VARIANT" BUILD_TYPE=Release PERSISTENT_KEYS=ON
 
 echo "==> Installing libdave"
-make -C "$LIBDAVE_CPP" install SSL="$SSL_VARIANT" BUILD_TYPE=Release
+make -C "$LIBDAVE_CPP" install SSL="$SSL_VARIANT" BUILD_TYPE=Release PERSISTENT_KEYS=ON
 
 # --- Copy artifacts to dave/deps ---
 echo "==> Installing to $DEPS_DIR"
