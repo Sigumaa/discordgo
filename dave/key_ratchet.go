@@ -1,38 +1,27 @@
 package dave
 
 /*
-#include "libdave_c.h"
+#include "dave/dave.h"
 */
 import "C"
 import "runtime"
 
 // KeyRatchet wraps a libdave key ratchet handle.
-// It is obtained from MLSSession.GetKeyRatchet and passed to
-// Encryptor.SetKeyRatchet or Decryptor.TransitionToKeyRatchet.
-// Once passed to an encryptor or decryptor, the KeyRatchet handle
-// is consumed and must not be used again.
 type KeyRatchet struct {
-	h *C.dave_key_ratchet_t
+	h C.DAVEKeyRatchetHandle
 }
 
-func newKeyRatchet(h *C.dave_key_ratchet_t) *KeyRatchet {
+func newKeyRatchet(h C.DAVEKeyRatchetHandle) *KeyRatchet {
 	kr := &KeyRatchet{h: h}
-	runtime.SetFinalizer(kr, (*KeyRatchet).destroy)
+	runtime.SetFinalizer(kr, (*KeyRatchet).Close)
 	return kr
 }
 
-func (kr *KeyRatchet) destroy() {
+// Close destroys the key ratchet.
+func (kr *KeyRatchet) Close() {
 	if kr.h != nil {
-		C.dave_key_ratchet_destroy(kr.h)
+		C.daveKeyRatchetDestroy(kr.h)
 		kr.h = nil
+		runtime.SetFinalizer(kr, nil)
 	}
-}
-
-// consume takes the underlying handle and nullifies the wrapper so the
-// finalizer becomes a no-op. Used when ownership transfers to C.
-func (kr *KeyRatchet) consume() *C.dave_key_ratchet_t {
-	h := kr.h
-	kr.h = nil
-	runtime.SetFinalizer(kr, nil)
-	return h
 }

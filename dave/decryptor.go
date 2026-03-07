@@ -1,7 +1,7 @@
 package dave
 
 /*
-#include "libdave_c.h"
+#include "dave/dave.h"
 */
 import "C"
 import (
@@ -12,12 +12,12 @@ import (
 
 // Decryptor wraps a libdave frame decryptor.
 type Decryptor struct {
-	h *C.dave_decryptor_t
+	h C.DAVEDecryptorHandle
 }
 
 // NewDecryptor creates a new DAVE frame decryptor.
 func NewDecryptor() *Decryptor {
-	d := &Decryptor{h: C.dave_decryptor_create()}
+	d := &Decryptor{h: C.daveDecryptorCreate()}
 	runtime.SetFinalizer(d, (*Decryptor).Close)
 	return d
 }
@@ -28,52 +28,50 @@ func (d *Decryptor) Decrypt(mediaType int, encryptedFrame []byte) ([]byte, error
 		return encryptedFrame, nil
 	}
 
-	maxSize := C.dave_decryptor_get_max_plaintext_byte_size(
+	maxSize := C.daveDecryptorGetMaxPlaintextByteSize(
 		d.h,
-		C.dave_media_type(mediaType),
+		C.DAVEMediaType(mediaType),
 		C.size_t(len(encryptedFrame)),
 	)
 
 	out := make([]byte, maxSize)
-	written := C.dave_decryptor_decrypt(
+	var bytesWritten C.size_t
+
+	rc := C.daveDecryptorDecrypt(
 		d.h,
-		C.dave_media_type(mediaType),
+		C.DAVEMediaType(mediaType),
 		(*C.uint8_t)(unsafe.Pointer(&encryptedFrame[0])),
 		C.size_t(len(encryptedFrame)),
 		(*C.uint8_t)(unsafe.Pointer(&out[0])),
 		maxSize,
+		&bytesWritten,
 	)
 
-	if written == 0 {
-		return nil, fmt.Errorf("dave: decrypt failed")
+	if rc != C.DAVE_DECRYPTOR_RESULT_CODE_SUCCESS {
+		return nil, fmt.Errorf("dave: decrypt failed with code %d", rc)
 	}
 
-	return out[:written], nil
+	return out[:bytesWritten], nil
 }
 
 // TransitionToKeyRatchet transitions the decryptor to a new key ratchet.
-// The old keys are kept for transitionExpiryMs (0 = default 10s).
-// The KeyRatchet is consumed.
-func (d *Decryptor) TransitionToKeyRatchet(kr *KeyRatchet, transitionExpiryMs uint32) {
+// The decryptor does NOT take ownership; the caller must keep the KeyRatchet alive.
+func (d *Decryptor) TransitionToKeyRatchet(kr *KeyRatchet) {
 	if kr == nil {
 		return
 	}
-	C.dave_decryptor_transition_to_key_ratchet(d.h, kr.consume(), C.uint32_t(transitionExpiryMs))
+	C.daveDecryptorTransitionToKeyRatchet(d.h, kr.h)
 }
 
 // TransitionToPassthroughMode transitions the decryptor to/from passthrough.
-func (d *Decryptor) TransitionToPassthroughMode(passthrough bool, transitionExpiryMs uint32) {
-	v := C.int(0)
-	if passthrough {
-		v = 1
-	}
-	C.dave_decryptor_transition_to_passthrough_mode(d.h, v, C.uint32_t(transitionExpiryMs))
+func (d *Decryptor) TransitionToPassthroughMode(passthrough bool) {
+	C.daveDecryptorTransitionToPassthroughMode(d.h, C.bool(passthrough))
 }
 
 // Close destroys the decryptor.
 func (d *Decryptor) Close() {
 	if d.h != nil {
-		C.dave_decryptor_destroy(d.h)
+		C.daveDecryptorDestroy(d.h)
 		d.h = nil
 		runtime.SetFinalizer(d, nil)
 	}

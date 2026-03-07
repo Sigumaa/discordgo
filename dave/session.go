@@ -1,7 +1,7 @@
 package dave
 
 /*
-#include "libdave_c.h"
+#include "dave/dave.h"
 #include <stdlib.h>
 */
 import "C"
@@ -13,15 +13,18 @@ import (
 
 // MLSSession wraps a libdave MLS session.
 type MLSSession struct {
-	h *C.dave_session_t
+	h C.DAVESessionHandle
 }
 
 // NewMLSSession creates a new MLS session with the given auth session ID.
 func NewMLSSession(authSessionID string) (*MLSSession, error) {
-	cAuth := C.CString(authSessionID)
-	defer C.free(unsafe.Pointer(cAuth))
+	var cAuth *C.char
+	if authSessionID != "" {
+		cAuth = C.CString(authSessionID)
+		defer C.free(unsafe.Pointer(cAuth))
+	}
 
-	h := C.dave_session_create(cAuth)
+	h := C.daveSessionCreate(nil, cAuth, nil, nil)
 	if h == nil {
 		return nil, fmt.Errorf("dave: failed to create MLS session")
 	}
@@ -35,38 +38,45 @@ func NewMLSSession(authSessionID string) (*MLSSession, error) {
 func (s *MLSSession) Init(protocolVersion uint16, groupID uint64, selfUserID string) {
 	cUser := C.CString(selfUserID)
 	defer C.free(unsafe.Pointer(cUser))
-	C.dave_session_init(s.h, C.uint16_t(protocolVersion), C.uint64_t(groupID), cUser)
+	C.daveSessionInit(s.h, C.uint16_t(protocolVersion), C.uint64_t(groupID), cUser)
 }
 
 // Reset resets the MLS session state.
 func (s *MLSSession) Reset() {
-	C.dave_session_reset(s.h)
+	C.daveSessionReset(s.h)
 }
 
 // SetProtocolVersion updates the protocol version.
 func (s *MLSSession) SetProtocolVersion(version uint16) {
-	C.dave_session_set_protocol_version(s.h, C.uint16_t(version))
+	C.daveSessionSetProtocolVersion(s.h, C.uint16_t(version))
 }
 
 // GetProtocolVersion returns the current protocol version.
 func (s *MLSSession) GetProtocolVersion() uint16 {
-	return uint16(C.dave_session_get_protocol_version(s.h))
+	return uint16(C.daveSessionGetProtocolVersion(s.h))
+}
+
+// SetExternalSender sets the external sender credentials.
+func (s *MLSSession) SetExternalSender(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	C.daveSessionSetExternalSender(s.h, (*C.uint8_t)(unsafe.Pointer(&data[0])), C.size_t(len(data)))
 }
 
 // GetMarshalledKeyPackage returns a marshalled MLS key package.
-// A new key package is generated each call (key packages are not reusable).
 func (s *MLSSession) GetMarshalledKeyPackage() ([]byte, error) {
-	var outLen C.size_t
-	ptr := C.dave_session_get_marshalled_key_package(s.h, &outLen)
-	if ptr == nil {
+	var ptr *C.uint8_t
+	var length C.size_t
+	C.daveSessionGetMarshalledKeyPackage(s.h, &ptr, &length)
+	if ptr == nil || length == 0 {
 		return nil, fmt.Errorf("dave: failed to get marshalled key package")
 	}
 	defer cgoFree(unsafe.Pointer(ptr))
-	return C.GoBytes(unsafe.Pointer(ptr), C.int(outLen)), nil
+	return C.GoBytes(unsafe.Pointer(ptr), C.int(length)), nil
 }
 
-// ProcessProposals processes MLS proposals and returns a commit message if one
-// was generated. Returns nil if no commit was produced.
+// ProcessProposals processes MLS proposals.
 func (s *MLSSession) ProcessProposals(proposals []byte, recognizedUserIDs []string) ([]byte, error) {
 	cUserIDs := make([]*C.char, len(recognizedUserIDs))
 	for i, uid := range recognizedUserIDs {
@@ -79,78 +89,49 @@ func (s *MLSSession) ProcessProposals(proposals []byte, recognizedUserIDs []stri
 		userIDsPtr = &cUserIDs[0]
 	}
 
+	var outPtr *C.uint8_t
 	var outLen C.size_t
-	ptr := C.dave_session_process_proposals(
+
+	C.daveSessionProcessProposals(
 		s.h,
 		(*C.uint8_t)(unsafe.Pointer(&proposals[0])),
 		C.size_t(len(proposals)),
 		userIDsPtr,
 		C.size_t(len(recognizedUserIDs)),
+		&outPtr,
 		&outLen,
 	)
-	if ptr == nil {
+
+	if outPtr == nil || outLen == 0 {
 		return nil, nil
 	}
-	defer cgoFree(unsafe.Pointer(ptr))
-	return C.GoBytes(unsafe.Pointer(ptr), C.int(outLen)), nil
+	defer cgoFree(unsafe.Pointer(outPtr))
+	return C.GoBytes(unsafe.Pointer(outPtr), C.int(outLen)), nil
 }
 
 // ProcessCommit processes an MLS commit message.
-func (s *MLSSession) ProcessCommit(commit []byte) (CommitResultType, []RosterEntry, error) {
-	var resultType C.int
-	var rosterIDs *C.uint64_t
-	var rosterKeys **C.uint8_t
-	var rosterKeyLens *C.size_t
-	var rosterCount C.size_t
-
-	C.dave_session_process_commit(
+func (s *MLSSession) ProcessCommit(commit []byte) (CommitResultType, error) {
+	result := C.daveSessionProcessCommit(
 		s.h,
 		(*C.uint8_t)(unsafe.Pointer(&commit[0])),
 		C.size_t(len(commit)),
-		&resultType,
-		&rosterIDs,
-		&rosterKeys,
-		&rosterKeyLens,
-		&rosterCount,
 	)
-
-	rt := CommitResultType(resultType)
-	if rt != CommitOK || rosterCount == 0 {
-		return rt, nil, nil
+	if result == nil {
+		return CommitFailed, fmt.Errorf("dave: process commit returned nil")
 	}
+	defer C.daveCommitResultDestroy(result)
 
-	defer func() {
-		cgoFree(unsafe.Pointer(rosterIDs))
-		// Free individual key buffers
-		keySlice := unsafe.Slice(rosterKeys, rosterCount)
-		for _, k := range keySlice {
-			if k != nil {
-				cgoFree(unsafe.Pointer(k))
-			}
-		}
-		cgoFree(unsafe.Pointer(rosterKeys))
-		cgoFree(unsafe.Pointer(rosterKeyLens))
-	}()
-
-	count := int(rosterCount)
-	ids := unsafe.Slice(rosterIDs, count)
-	keys := unsafe.Slice(rosterKeys, count)
-	keyLens := unsafe.Slice(rosterKeyLens, count)
-
-	entries := make([]RosterEntry, count)
-	for i := 0; i < count; i++ {
-		entries[i].UserID = uint64(ids[i])
-		kLen := int(keyLens[i])
-		if kLen > 0 && keys[i] != nil {
-			entries[i].Key = C.GoBytes(unsafe.Pointer(keys[i]), C.int(kLen))
-		}
+	if C.daveCommitResultIsFailed(result) {
+		return CommitFailed, nil
 	}
-
-	return rt, entries, nil
+	if C.daveCommitResultIsIgnored(result) {
+		return CommitIgnored, nil
+	}
+	return CommitOK, nil
 }
 
 // ProcessWelcome processes an MLS welcome message.
-func (s *MLSSession) ProcessWelcome(welcome []byte, recognizedUserIDs []string) ([]RosterEntry, error) {
+func (s *MLSSession) ProcessWelcome(welcome []byte, recognizedUserIDs []string) error {
 	cUserIDs := make([]*C.char, len(recognizedUserIDs))
 	for i, uid := range recognizedUserIDs {
 		cUserIDs[i] = C.CString(uid)
@@ -162,65 +143,25 @@ func (s *MLSSession) ProcessWelcome(welcome []byte, recognizedUserIDs []string) 
 		userIDsPtr = &cUserIDs[0]
 	}
 
-	var rosterIDs *C.uint64_t
-	var rosterKeys **C.uint8_t
-	var rosterKeyLens *C.size_t
-	var rosterCount C.size_t
-
-	ok := C.dave_session_process_welcome(
+	result := C.daveSessionProcessWelcome(
 		s.h,
 		(*C.uint8_t)(unsafe.Pointer(&welcome[0])),
 		C.size_t(len(welcome)),
 		userIDsPtr,
 		C.size_t(len(recognizedUserIDs)),
-		&rosterIDs,
-		&rosterKeys,
-		&rosterKeyLens,
-		&rosterCount,
 	)
-
-	if ok == 0 {
-		return nil, fmt.Errorf("dave: process welcome failed")
+	if result == nil {
+		return fmt.Errorf("dave: process welcome failed")
 	}
-
-	if rosterCount == 0 {
-		return nil, nil
-	}
-
-	defer func() {
-		cgoFree(unsafe.Pointer(rosterIDs))
-		keySlice := unsafe.Slice(rosterKeys, rosterCount)
-		for _, k := range keySlice {
-			if k != nil {
-				cgoFree(unsafe.Pointer(k))
-			}
-		}
-		cgoFree(unsafe.Pointer(rosterKeys))
-		cgoFree(unsafe.Pointer(rosterKeyLens))
-	}()
-
-	count := int(rosterCount)
-	ids := unsafe.Slice(rosterIDs, count)
-	keys := unsafe.Slice(rosterKeys, count)
-	keyLens := unsafe.Slice(rosterKeyLens, count)
-
-	entries := make([]RosterEntry, count)
-	for i := 0; i < count; i++ {
-		entries[i].UserID = uint64(ids[i])
-		kLen := int(keyLens[i])
-		if kLen > 0 && keys[i] != nil {
-			entries[i].Key = C.GoBytes(unsafe.Pointer(keys[i]), C.int(kLen))
-		}
-	}
-
-	return entries, nil
+	C.daveWelcomeResultDestroy(result)
+	return nil
 }
 
 // GetKeyRatchet returns a key ratchet for the given user ID.
 func (s *MLSSession) GetKeyRatchet(userID string) *KeyRatchet {
 	cUser := C.CString(userID)
 	defer C.free(unsafe.Pointer(cUser))
-	h := C.dave_session_get_key_ratchet(s.h, cUser)
+	h := C.daveSessionGetKeyRatchet(s.h, cUser)
 	if h == nil {
 		return nil
 	}
@@ -230,7 +171,7 @@ func (s *MLSSession) GetKeyRatchet(userID string) *KeyRatchet {
 // Close destroys the underlying MLS session.
 func (s *MLSSession) Close() {
 	if s.h != nil {
-		C.dave_session_destroy(s.h)
+		C.daveSessionDestroy(s.h)
 		s.h = nil
 		runtime.SetFinalizer(s, nil)
 	}

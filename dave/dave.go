@@ -16,6 +16,7 @@ type DAVESession struct {
 	encryptor       *Encryptor
 	decryptors      map[uint32]*Decryptor // per-SSRC
 	oldDecryptors   map[uint32]*Decryptor // kept during epoch transition
+	keyRatchets     []*KeyRatchet         // kept alive while enc/dec reference them
 	epoch           uint64
 	protocolVersion uint16
 	passthrough     bool
@@ -23,7 +24,6 @@ type DAVESession struct {
 	groupID         uint64
 	authSessionID   string
 
-	// cleanupTimer cleans up old decryptors after epoch transition
 	cleanupTimer *time.Timer
 }
 
@@ -66,7 +66,7 @@ func (ds *DAVESession) Reset() {
 	ds.passthrough = true
 
 	for _, d := range ds.decryptors {
-		d.TransitionToPassthroughMode(true, DefaultTransitionExpiryMs)
+		d.TransitionToPassthroughMode(true)
 	}
 }
 
@@ -79,7 +79,6 @@ func (ds *DAVESession) GetMarshalledKeyPackage() ([]byte, error) {
 }
 
 // EncryptOpusFrame encrypts an opus frame using DAVE E2EE.
-// If passthrough mode is active, returns the frame unchanged.
 func (ds *DAVESession) EncryptOpusFrame(ssrc uint32, frame []byte) ([]byte, error) {
 	ds.mu.RLock()
 	defer ds.mu.RUnlock()
@@ -92,7 +91,6 @@ func (ds *DAVESession) EncryptOpusFrame(ssrc uint32, frame []byte) ([]byte, erro
 }
 
 // DecryptOpusFrame decrypts a DAVE-encrypted opus frame.
-// If passthrough mode is active, returns the frame unchanged.
 func (ds *DAVESession) DecryptOpusFrame(ssrc uint32, frame []byte) ([]byte, error) {
 	ds.mu.RLock()
 	defer ds.mu.RUnlock()
@@ -103,7 +101,6 @@ func (ds *DAVESession) DecryptOpusFrame(ssrc uint32, frame []byte) ([]byte, erro
 
 	d, ok := ds.decryptors[ssrc]
 	if !ok {
-		// Try old decryptors during transition
 		d, ok = ds.oldDecryptors[ssrc]
 		if !ok {
 			return nil, fmt.Errorf("dave: no decryptor for SSRC %d", ssrc)
@@ -124,20 +121,19 @@ func (ds *DAVESession) GetOrCreateDecryptor(ssrc uint32) *Decryptor {
 	}
 	d := NewDecryptor()
 	if ds.passthrough {
-		d.TransitionToPassthroughMode(true, 0)
+		d.TransitionToPassthroughMode(true)
 	}
 	ds.decryptors[ssrc] = d
 	return d
 }
 
-// voicePrepareEpochData represents the data from opcode 24 (DAVE Prepare Epoch).
+// voicePrepareEpochData represents the data from opcode 24.
 type voicePrepareEpochData struct {
 	ProtocolVersion uint16 `json:"protocol_version"`
 	Epoch           uint64 `json:"epoch"`
 }
 
 // HandlePrepareEpoch handles voice opcode 24 (DAVE_PREPARE_EPOCH).
-// It prepares the session for a new epoch.
 func (ds *DAVESession) HandlePrepareEpoch(data json.RawMessage) error {
 	var d voicePrepareEpochData
 	if err := json.Unmarshal(data, &d); err != nil {
@@ -154,14 +150,12 @@ func (ds *DAVESession) HandlePrepareEpoch(data json.RawMessage) error {
 	return nil
 }
 
-// voiceExecuteTransitionData represents the data from opcode 22
-// (DAVE MLS External Sender Package / Execute Transition).
+// voiceExecuteTransitionData represents the data from opcode 22.
 type voiceExecuteTransitionData struct {
-	TransitionID uint16 `json:"transition_id"`
-	Proposals    []byte `json:"proposals,omitempty"`
-	Commit       []byte `json:"commit,omitempty"`
-	Welcome      []byte `json:"welcome,omitempty"`
-	// Recognized user IDs for MLS verification
+	TransitionID      uint16 `json:"transition_id"`
+	Proposals         []byte `json:"proposals,omitempty"`
+	Commit            []byte `json:"commit,omitempty"`
+	Welcome           []byte `json:"welcome,omitempty"`
 	RecognizedUserIDs []string `json:"recognized_user_ids,omitempty"`
 }
 
@@ -171,9 +165,7 @@ type TransitionResult struct {
 	KeyPackage   []byte `json:"key_package,omitempty"`
 }
 
-// HandleExecuteTransition handles voice opcode 22 (DAVE MLS Execute Transition).
-// It processes MLS proposals/commit/welcome and returns the transition response
-// to be sent as opcode 23.
+// HandleExecuteTransition handles voice opcode 22.
 func (ds *DAVESession) HandleExecuteTransition(data json.RawMessage) (*TransitionResult, error) {
 	var d voiceExecuteTransitionData
 	if err := json.Unmarshal(data, &d); err != nil {
@@ -187,18 +179,15 @@ func (ds *DAVESession) HandleExecuteTransition(data json.RawMessage) (*Transitio
 		TransitionID: d.TransitionID,
 	}
 
-	// Process proposals if present
 	if len(d.Proposals) > 0 {
-		commitMsg, err := ds.mlsSession.ProcessProposals(d.Proposals, d.RecognizedUserIDs)
+		_, err := ds.mlsSession.ProcessProposals(d.Proposals, d.RecognizedUserIDs)
 		if err != nil {
 			return nil, fmt.Errorf("dave: process proposals: %w", err)
 		}
-		_ = commitMsg // commit is sent by the server, not by us
 	}
 
-	// Process commit if present
 	if len(d.Commit) > 0 {
-		resultType, _, err := ds.mlsSession.ProcessCommit(d.Commit)
+		resultType, err := ds.mlsSession.ProcessCommit(d.Commit)
 		if err != nil {
 			return nil, fmt.Errorf("dave: process commit: %w", err)
 		}
@@ -210,16 +199,14 @@ func (ds *DAVESession) HandleExecuteTransition(data json.RawMessage) (*Transitio
 		}
 	}
 
-	// Process welcome if present
 	if len(d.Welcome) > 0 {
-		_, err := ds.mlsSession.ProcessWelcome(d.Welcome, d.RecognizedUserIDs)
+		err := ds.mlsSession.ProcessWelcome(d.Welcome, d.RecognizedUserIDs)
 		if err != nil {
 			return nil, fmt.Errorf("dave: process welcome: %w", err)
 		}
 		ds.updateEncryptionKeys()
 	}
 
-	// Get key package for the response
 	kp, err := ds.mlsSession.GetMarshalledKeyPackage()
 	if err != nil {
 		return nil, fmt.Errorf("dave: get key package: %w", err)
@@ -232,11 +219,18 @@ func (ds *DAVESession) HandleExecuteTransition(data json.RawMessage) (*Transitio
 // updateEncryptionKeys updates the encryptor and decryptors with new keys
 // from the current MLS epoch. Must be called with ds.mu held.
 func (ds *DAVESession) updateEncryptionKeys() {
+	// Release old key ratchets
+	for _, kr := range ds.keyRatchets {
+		kr.Close()
+	}
+	ds.keyRatchets = nil
+
 	// Update encryptor with our own key ratchet
 	kr := ds.mlsSession.GetKeyRatchet(ds.selfUserID)
 	if kr != nil {
 		ds.encryptor.SetKeyRatchet(kr)
 		ds.encryptor.SetPassthroughMode(false)
+		ds.keyRatchets = append(ds.keyRatchets, kr)
 	}
 	ds.passthrough = false
 
@@ -253,7 +247,6 @@ func (ds *DAVESession) updateEncryptionKeys() {
 	ds.oldDecryptors = ds.decryptors
 	ds.decryptors = make(map[uint32]*Decryptor)
 
-	// Schedule cleanup of old decryptors
 	ds.cleanupTimer = time.AfterFunc(time.Duration(DefaultTransitionExpiryMs)*time.Millisecond, func() {
 		ds.mu.Lock()
 		defer ds.mu.Unlock()
@@ -274,9 +267,10 @@ func (ds *DAVESession) TransitionDecryptor(ssrc uint32, userID string) {
 	if kr == nil {
 		return
 	}
+	ds.keyRatchets = append(ds.keyRatchets, kr)
 
 	d := ds.getOrCreateDecryptorLocked(ssrc)
-	d.TransitionToKeyRatchet(kr, DefaultTransitionExpiryMs)
+	d.TransitionToKeyRatchet(kr)
 }
 
 func (ds *DAVESession) getOrCreateDecryptorLocked(ssrc uint32) *Decryptor {
@@ -312,6 +306,11 @@ func (ds *DAVESession) Close() {
 		d.Close()
 	}
 	ds.oldDecryptors = nil
+
+	for _, kr := range ds.keyRatchets {
+		kr.Close()
+	}
+	ds.keyRatchets = nil
 
 	if ds.mlsSession != nil {
 		ds.mlsSession.Close()
