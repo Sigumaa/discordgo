@@ -3,3 +3,7 @@
 
 # Environment variables. Useful for examples.
 .env
+
+# DAVE (libdave) build artifacts
+dave/deps/
+.libdave/

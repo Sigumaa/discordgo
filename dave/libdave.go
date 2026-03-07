@@ -1,8 +1,8 @@
 package dave
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../libdave/cpp/build/install/include
-#cgo LDFLAGS: -L${SRCDIR}/../../libdave/cpp/build/install/lib -L${SRCDIR}/../../libdave/cpp/build/vcpkg_installed/arm64-osx/lib -ldave -lmlspp -lmls_vectors -lmls_ds -lbytes -ltls_syntax -lhpke -lssl -lcrypto -lstdc++
+#cgo CFLAGS: -I${SRCDIR}/deps/include
+#cgo LDFLAGS: -L${SRCDIR}/deps/lib -ldave -lmlspp -lmls_vectors -lmls_ds -lbytes -ltls_syntax -lhpke -lssl -lcrypto -lstdc++
 #include "dave/dave.h"
 #include <stdlib.h>
 */

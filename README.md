@@ -66,38 +66,80 @@ DAVE requires [libdave](https://github.com/discord/libdave) (Discord's official 
 - **Go 1.21+**
 - **C/C++ compiler** (Clang or GCC)
 - **CMake 3.16+**
-- **Git** (for cloning and submodule init)
-- **pkg-config** (`brew install pkg-config` on macOS)
+- **Git**
+- **pkg-config**
 
-### Building libdave
+**macOS:**
+```sh
+brew install cmake pkg-config
+```
 
-Clone and build libdave **next to** your discordgo directory (the CGo flags expect `../libdave` relative to the discordgo root):
+**Debian / Ubuntu:**
+```sh
+sudo apt-get install build-essential cmake pkg-config git curl zip unzip tar
+```
+
+**Fedora / RHEL:**
+```sh
+sudo dnf install gcc-c++ cmake pkgconf git
+```
+
+### Setup (recommended)
+
+A setup script is provided that handles cloning, building, and installing libdave automatically:
 
 ```sh
-# From the parent directory of discordgo
+./scripts/setup-dave.sh
+```
+
+This will:
+1. Clone [discord/libdave](https://github.com/discord/libdave) into `.libdave/`
+2. Build it with vcpkg dependencies (OpenSSL 3.x by default)
+3. Copy all headers and static libraries into `dave/deps/`
+
+After completion, standard Go commands work:
+```sh
+go build ./...
+go test ./...
+```
+
+#### Script options
+
+```sh
+# Use a different SSL variant
+./scripts/setup-dave.sh --ssl boringssl
+
+# Use an existing libdave checkout
+./scripts/setup-dave.sh --libdave-dir /path/to/libdave
+```
+
+### Manual setup
+
+If you prefer to set up manually:
+
+```sh
 git clone https://github.com/discord/libdave.git
 cd libdave
 git submodule update --init --recursive
-
-# Bootstrap vcpkg (bundled as a submodule)
 cd cpp
 ./vcpkg/bootstrap-vcpkg.sh
-
-# Build (OpenSSL 3.x variant)
 make all SSL=openssl_3 BUILD_TYPE=Release
-
-# Install headers and static library
 make install SSL=openssl_3 BUILD_TYPE=Release
 ```
 
-After this, you should have:
-```
-libdave/cpp/build/install/lib/libdave.a
-libdave/cpp/build/install/include/dave/dave.h
-libdave/cpp/build/vcpkg_installed/arm64-osx/lib/  (mlspp, ssl, crypto, etc.)
-```
+Then copy the build artifacts into `dave/deps/`:
 
-> **Note:** The vcpkg triplet directory name varies by platform (e.g., `arm64-osx`, `x64-linux`). If you are not on Apple Silicon macOS, update the `#cgo LDFLAGS` path in `dave/libdave.go` accordingly.
+```sh
+mkdir -p /path/to/discordgo/dave/deps/{include,lib}
+
+# Headers
+cp -r cpp/build/install/include/dave /path/to/discordgo/dave/deps/include/
+
+# Libraries (adjust triplet for your platform: arm64-osx, x64-linux, etc.)
+cp cpp/build/install/lib/libdave.a /path/to/discordgo/dave/deps/lib/
+cp cpp/build/vcpkg_installed/<triplet>/lib/lib{mlspp,mls_vectors,mls_ds,bytes,tls_syntax,hpke,ssl,crypto}.a \
+   /path/to/discordgo/dave/deps/lib/
+```
 
 ### Usage
 
