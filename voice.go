@@ -1168,6 +1168,8 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 	var noAEADDrops int
 	var transportDecryptDrops int
 	var daveDecryptDrops int
+	var decryptedPackets int
+	var forwardedPackets int
 
 	for {
 		rlen, err := udpConn.Read(recvbuf)
@@ -1215,8 +1217,8 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			continue
 		}
 		rtpReads++
-		if rtpReads == 1 {
-			v.log(LogInformational, "voice first RTP audio packet received (len=%d payload_type=%d)", rlen, recvbuf[1]&0x7F)
+		if rtpReads <= 5 {
+			v.log(LogInformational, "voice RTP audio packet received (len=%d payload_type=%d ssrc=%d seq=%d count=%d)", rlen, recvbuf[1]&0x7F, binary.BigEndian.Uint32(recvbuf[8:12]), binary.BigEndian.Uint16(recvbuf[2:4]), rtpReads)
 		}
 
 		// build a audio packet struct
@@ -1311,20 +1313,28 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			}
 
 			p.Opus = plain
+			decryptedPackets++
+			if decryptedPackets <= 5 {
+				v.log(LogInformational, "voice audio packet decrypted (ssrc=%d seq=%d opus_bytes=%d count=%d)", p.SSRC, p.Sequence, len(p.Opus), decryptedPackets)
+			}
 		} else {
+			transportDecryptDrops++
+			if transportDecryptDrops <= 5 {
+				v.log(LogDebug, "voice transport decrypt failed for SSRC %d seq=%d (count=%d)", p.SSRC, p.Sequence, transportDecryptDrops)
+			}
 			continue
 		}
 
 		if c != nil {
 			select {
 			case c <- &p:
+				forwardedPackets++
+				if forwardedPackets <= 5 {
+					v.log(LogInformational, "voice audio packet forwarded (ssrc=%d seq=%d opus_bytes=%d count=%d)", p.SSRC, p.Sequence, len(p.Opus), forwardedPackets)
+				}
 			case <-close:
 				return
 			}
-		}
-		transportDecryptDrops++
-		if transportDecryptDrops <= 5 {
-			v.log(LogDebug, "voice transport decrypt failed for SSRC %d (count=%d)", p.SSRC, transportDecryptDrops)
 		}
 	}
 }
