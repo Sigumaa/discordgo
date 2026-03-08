@@ -1234,7 +1234,6 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 
 			// DAVE E2EE: decrypt after transport decryption
 			if v.daveSession != nil {
-				v.daveSession.GetOrCreateDecryptor(p.SSRC)
 				decrypted, daveErr := v.daveSession.DecryptOpusFrame(p.SSRC, plain)
 				if daveErr != nil {
 					v.log(LogDebug, "DAVE decrypt error for SSRC %d: %s", p.SSRC, daveErr)
