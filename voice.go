@@ -239,6 +239,63 @@ func (v *VoiceConnection) AddHandler(h VoiceSpeakingUpdateHandler) {
 	v.voiceSpeakingUpdateHandlers = append(v.voiceSpeakingUpdateHandlers, h)
 }
 
+func trimDecryptedVoicePayload(plain []byte, extPayloadBytes int) ([]byte, bool) {
+	if extPayloadBytes <= 0 {
+		return plain, true
+	}
+	if len(plain) < extPayloadBytes {
+		return plain, false
+	}
+	return plain[extPayloadBytes:], true
+}
+
+func (v *VoiceConnection) inferSingleRemoteUserID() string {
+	if v == nil || v.session == nil || v.session.State == nil || v.GuildID == "" || v.ChannelID == "" {
+		return ""
+	}
+
+	guild, err := v.session.State.Guild(v.GuildID)
+	if err != nil || guild == nil {
+		return ""
+	}
+
+	candidate := ""
+	for _, state := range guild.VoiceStates {
+		if state == nil || state.ChannelID != v.ChannelID || state.UserID == "" || state.UserID == v.UserID {
+			continue
+		}
+		if candidate == "" {
+			candidate = state.UserID
+			continue
+		}
+		if candidate != state.UserID {
+			return ""
+		}
+	}
+
+	return candidate
+}
+
+func (v *VoiceConnection) retryDaveDecryptWithInferredSpeaker(ssrc uint32, plain []byte, recvCount int) ([]byte, bool) {
+	if v == nil || v.daveSession == nil {
+		return nil, false
+	}
+
+	userID := v.inferSingleRemoteUserID()
+	if userID == "" {
+		return nil, false
+	}
+
+	v.daveSession.RegisterSSRC(ssrc, userID)
+	v.log(LogInformational, "voice inferred DAVE speaker mapping (ssrc=%d user_id=%s count=%d)", ssrc, userID, recvCount)
+
+	decrypted, err := v.daveSession.DecryptOpusFrame(ssrc, plain)
+	if err != nil {
+		return nil, false
+	}
+	return decrypted, true
+}
+
 // VoiceSpeakingUpdate is a struct for a VoiceSpeakingUpdate event.
 type VoiceSpeakingUpdate struct {
 	UserID   string `json:"user_id"`
@@ -1292,16 +1349,24 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 		// AAD must cover the unencrypted header portion.
 		if plain, err := v.aead.Open(nil, nonce[:], cipherTextPayload, recvbuf[:aadLen]); err == nil {
 			// If header extensions are present, strip decrypted extension payload to get to Opus.
-			if extPayloadBytes > 0 {
-				if len(plain) < extPayloadBytes {
-					continue
+			if trimmed, ok := trimDecryptedVoicePayload(plain, extPayloadBytes); ok {
+				plain = trimmed
+			} else {
+				shortPayloadDrops++
+				if shortPayloadDrops <= 5 {
+					v.log(LogDebug, "voice RTP extension exceeded decrypted payload (ssrc=%d seq=%d plain=%d ext=%d count=%d)", p.SSRC, p.Sequence, len(plain), extPayloadBytes, shortPayloadDrops)
 				}
-				plain = plain[extPayloadBytes:]
 			}
 
 			// DAVE E2EE: decrypt after transport decryption
 			if v.daveSession != nil {
 				decrypted, daveErr := v.daveSession.DecryptOpusFrame(p.SSRC, plain)
+				if daveErr != nil {
+					if inferred, ok := v.retryDaveDecryptWithInferredSpeaker(p.SSRC, plain, decryptedPackets+1); ok {
+						decrypted = inferred
+						daveErr = nil
+					}
+				}
 				if daveErr != nil {
 					daveDecryptDrops++
 					if daveDecryptDrops <= 5 {
