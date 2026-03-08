@@ -78,6 +78,7 @@ type VoiceConnection struct {
 	daveEnabled       bool
 	daveProtoVersion  uint16
 	daveTransitionID  uint16
+	daveExternalReady bool
 	pendingDaveBinary [][]byte
 }
 
@@ -188,6 +189,7 @@ func (v *VoiceConnection) Close() {
 		v.daveSession.Close()
 		v.daveSession = nil
 	}
+	v.daveExternalReady = false
 
 	if v.close != nil {
 		v.log(LogInformational, "closing v.close")
@@ -534,6 +536,7 @@ func (v *VoiceConnection) onEvent(message []byte) {
 						v.log(LogError, "failed to create DAVE session: %s", err)
 					} else {
 						v.daveSession = ds
+						v.daveExternalReady = false
 						// Parse GuildID as uint64 for group ID
 						gid, _ := strconv.ParseUint(v.GuildID, 10, 64)
 						v.daveSession.Init(v.daveProtoVersion, gid)
@@ -656,13 +659,28 @@ func (v *VoiceConnection) onDaveBinaryEvent(message []byte) {
 			v.log(LogError, "DAVE external sender error: %s", err)
 			return
 		}
+		v.Lock()
+		v.daveExternalReady = true
+		v.Unlock()
 		if err := v.sendDaveBinary(dave.BinaryOpcodeKeyPackage, keyPackage); err != nil {
 			v.log(LogError, "DAVE: error sending key package: %s", err)
 		} else {
 			v.log(LogInformational, "DAVE: sent key package (%d bytes)", len(keyPackage))
 		}
+		go v.flushPendingDaveBinary()
 
 	case dave.BinaryOpcodeProposals: // 27
+		v.RLock()
+		externalReady := v.daveExternalReady
+		v.RUnlock()
+		if !externalReady {
+			v.Lock()
+			v.pendingDaveBinary = append(v.pendingDaveBinary, append([]byte(nil), message...))
+			queued := len(v.pendingDaveBinary)
+			v.Unlock()
+			v.log(LogWarning, "queued DAVE proposals until external sender is ready (%d queued)", queued)
+			return
+		}
 		v.log(LogInformational, "DAVE: received proposals (%d bytes)", len(payload))
 		commitWelcome, err := v.daveSession.HandleProposalsBinary(payload)
 		if err != nil {
@@ -1141,6 +1159,14 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 
 	recvbuf := make([]byte, 2048)
 	var nonce [12]byte
+	var udpReads int
+	var rtpReads int
+	var nonRTPDrops int
+	var shortHeaderDrops int
+	var shortPayloadDrops int
+	var noAEADDrops int
+	var transportDecryptDrops int
+	var daveDecryptDrops int
 
 	for {
 		rlen, err := udpConn.Read(recvbuf)
@@ -1160,6 +1186,7 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			}
 			return
 		}
+		udpReads++
 
 		select {
 		case <-close:
@@ -1171,7 +1198,15 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 		// For now, skip anything except RTP v2 packets (audio).
 		// RTP v2 => top two bits are 10 (0x80).
 		if rlen < 12 || (recvbuf[0]&0xC0) != 0x80 {
+			nonRTPDrops++
+			if nonRTPDrops <= 3 {
+				v.log(LogDebug, "voice udp packet skipped: not RTP audio (len=%d first_byte=0x%02x udp_reads=%d count=%d)", rlen, recvbuf[0], udpReads, nonRTPDrops)
+			}
 			continue
+		}
+		rtpReads++
+		if rtpReads == 1 {
+			v.log(LogInformational, "voice first RTP packet received (%d bytes)", rlen)
 		}
 
 		// build a audio packet struct
@@ -1190,6 +1225,10 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 
 		baseHeaderLen := 12 + (4 * cc)
 		if rlen < baseHeaderLen {
+			shortHeaderDrops++
+			if shortHeaderDrops <= 3 {
+				v.log(LogDebug, "voice udp packet skipped: short RTP header (len=%d need=%d count=%d)", rlen, baseHeaderLen, shortHeaderDrops)
+			}
 			continue
 		}
 
@@ -1197,6 +1236,10 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 		extPayloadBytes := 0
 		if hasExt {
 			if rlen < baseHeaderLen+4 {
+				shortHeaderDrops++
+				if shortHeaderDrops <= 3 {
+					v.log(LogDebug, "voice udp packet skipped: short RTP extension preamble (len=%d need=%d count=%d)", rlen, baseHeaderLen+4, shortHeaderDrops)
+				}
 				continue
 			}
 			// Extension length is in 32-bit words at the end of the extension preamble.
@@ -1206,12 +1249,20 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 		}
 
 		if rlen < aadLen+4 {
+			shortPayloadDrops++
+			if shortPayloadDrops <= 3 {
+				v.log(LogDebug, "voice udp packet skipped: short encrypted payload (len=%d aad=%d count=%d)", rlen, aadLen, shortPayloadDrops)
+			}
 			continue
 		}
 
 		// decrypt opus data
 		payload := recvbuf[aadLen:rlen]
 		if len(payload) < 4 {
+			shortPayloadDrops++
+			if shortPayloadDrops <= 3 {
+				v.log(LogDebug, "voice udp packet skipped: payload missing nonce suffix (len=%d count=%d)", len(payload), shortPayloadDrops)
+			}
 			continue
 		}
 		nonceCounter := payload[len(payload)-4:]
@@ -1220,6 +1271,10 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 		binary.LittleEndian.PutUint32(nonce[:4], binary.LittleEndian.Uint32(nonceCounter))
 
 		if v.aead == nil {
+			noAEADDrops++
+			if noAEADDrops <= 3 {
+				v.log(LogDebug, "voice udp packet skipped: transport AEAD not ready (count=%d)", noAEADDrops)
+			}
 			continue
 		}
 		// AAD must cover the unencrypted header portion.
@@ -1236,7 +1291,10 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			if v.daveSession != nil {
 				decrypted, daveErr := v.daveSession.DecryptOpusFrame(p.SSRC, plain)
 				if daveErr != nil {
-					v.log(LogDebug, "DAVE decrypt error for SSRC %d: %s", p.SSRC, daveErr)
+					daveDecryptDrops++
+					if daveDecryptDrops <= 5 {
+						v.log(LogDebug, "DAVE decrypt error for SSRC %d: %s (count=%d)", p.SSRC, daveErr, daveDecryptDrops)
+					}
 					continue
 				}
 				plain = decrypted
@@ -1253,6 +1311,10 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			case <-close:
 				return
 			}
+		}
+		transportDecryptDrops++
+		if transportDecryptDrops <= 5 {
+			v.log(LogDebug, "voice transport decrypt failed for SSRC %d (count=%d)", p.SSRC, transportDecryptDrops)
 		}
 	}
 }
