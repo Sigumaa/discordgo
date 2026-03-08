@@ -681,6 +681,8 @@ func (v *VoiceConnection) onDaveBinaryEvent(message []byte) {
 			v.RUnlock()
 			if tid != 0 {
 				v.sendDaveTransitionReady(tid)
+			} else {
+				v.log(LogInformational, "DAVE initial transition activated from proposals")
 			}
 		}
 
@@ -694,6 +696,8 @@ func (v *VoiceConnection) onDaveBinaryEvent(message []byte) {
 		// After processing commit, send transition ready
 		if transitionID != 0 {
 			v.sendDaveTransitionReady(transitionID)
+		} else {
+			v.log(LogInformational, "DAVE initial transition activated from commit")
 		}
 
 	case dave.BinaryOpcodeWelcome: // 30
@@ -706,6 +710,8 @@ func (v *VoiceConnection) onDaveBinaryEvent(message []byte) {
 		// After processing welcome, send transition ready
 		if transitionID != 0 {
 			v.sendDaveTransitionReady(transitionID)
+		} else {
+			v.log(LogInformational, "DAVE initial transition activated from welcome")
 		}
 
 	case dave.BinaryOpcodeCommitWelcome: // 28 (shouldn't normally be received by client)
