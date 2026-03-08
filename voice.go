@@ -296,6 +296,13 @@ func (v *VoiceConnection) retryDaveDecryptWithInferredSpeaker(ssrc uint32, plain
 	return decrypted, true
 }
 
+func shouldRetryDaveDecryptInference(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "no decryptor for SSRC")
+}
+
 // VoiceSpeakingUpdate is a struct for a VoiceSpeakingUpdate event.
 type VoiceSpeakingUpdate struct {
 	UserID   string `json:"user_id"`
@@ -1361,7 +1368,7 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			// DAVE E2EE: decrypt after transport decryption
 			if v.daveSession != nil {
 				decrypted, daveErr := v.daveSession.DecryptOpusFrame(p.SSRC, plain)
-				if daveErr != nil {
+				if shouldRetryDaveDecryptInference(daveErr) {
 					if inferred, ok := v.retryDaveDecryptWithInferredSpeaker(p.SSRC, plain, decryptedPackets+1); ok {
 						decrypted = inferred
 						daveErr = nil

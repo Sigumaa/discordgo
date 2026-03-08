@@ -91,3 +91,18 @@ func TestInferSingleRemoteUserIDReturnsEmptyForMultipleCandidates(t *testing.T) 
 		t.Fatalf("expected no candidate for multiple users, got %q", got)
 	}
 }
+
+func TestShouldRetryDaveDecryptInference(t *testing.T) {
+	if !shouldRetryDaveDecryptInference(assertErr("dave: no decryptor for SSRC 42")) {
+		t.Fatal("expected no-decryptor error to allow inference retry")
+	}
+	if shouldRetryDaveDecryptInference(assertErr("dave: decrypt failed")) {
+		t.Fatal("expected generic decrypt error to skip inference retry")
+	}
+}
+
+type assertErr string
+
+func (e assertErr) Error() string {
+	return string(e)
+}
