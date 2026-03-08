@@ -74,10 +74,11 @@ type VoiceConnection struct {
 	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
 
 	// DAVE E2EE fields
-	daveSession      *dave.DAVESession
-	daveEnabled      bool
-	daveProtoVersion uint16
-	daveTransitionID uint16
+	daveSession       *dave.DAVESession
+	daveEnabled       bool
+	daveProtoVersion  uint16
+	daveTransitionID  uint16
+	pendingDaveBinary [][]byte
 }
 
 // VoiceSpeakingUpdateHandler type provides a function definition for the
@@ -536,6 +537,7 @@ func (v *VoiceConnection) onEvent(message []byte) {
 						// Parse GuildID as uint64 for group ID
 						gid, _ := strconv.ParseUint(v.GuildID, 10, 64)
 						v.daveSession.Init(v.daveProtoVersion, gid)
+						go v.flushPendingDaveBinary()
 					}
 				}
 			}
@@ -616,10 +618,16 @@ func (v *VoiceConnection) onDaveBinaryEvent(message []byte) {
 		return
 	}
 
-	if v.daveSession == nil {
-		v.log(LogWarning, "received DAVE binary message but no DAVE session")
+	v.Lock()
+	hasSession := v.daveSession != nil
+	if !hasSession {
+		v.pendingDaveBinary = append(v.pendingDaveBinary, append([]byte(nil), message...))
+		queued := len(v.pendingDaveBinary)
+		v.Unlock()
+		v.log(LogWarning, "queued DAVE binary message until session is ready (%d queued)", queued)
 		return
 	}
+	v.Unlock()
 
 	var opcode byte
 	var payload []byte
@@ -671,7 +679,9 @@ func (v *VoiceConnection) onDaveBinaryEvent(message []byte) {
 			v.RLock()
 			tid := v.daveTransitionID
 			v.RUnlock()
-			v.sendDaveTransitionReady(tid)
+			if tid != 0 {
+				v.sendDaveTransitionReady(tid)
+			}
 		}
 
 	case dave.BinaryOpcodeAnnounceCommit: // 29
@@ -682,7 +692,9 @@ func (v *VoiceConnection) onDaveBinaryEvent(message []byte) {
 			return
 		}
 		// After processing commit, send transition ready
-		v.sendDaveTransitionReady(transitionID)
+		if transitionID != 0 {
+			v.sendDaveTransitionReady(transitionID)
+		}
 
 	case dave.BinaryOpcodeWelcome: // 30
 		v.log(LogInformational, "DAVE: received welcome (%d bytes)", len(payload))
@@ -692,7 +704,9 @@ func (v *VoiceConnection) onDaveBinaryEvent(message []byte) {
 			return
 		}
 		// After processing welcome, send transition ready
-		v.sendDaveTransitionReady(transitionID)
+		if transitionID != 0 {
+			v.sendDaveTransitionReady(transitionID)
+		}
 
 	case dave.BinaryOpcodeCommitWelcome: // 28 (shouldn't normally be received by client)
 		v.log(LogWarning, "DAVE: received unexpected commit_welcome opcode 28 (%d bytes)", len(payload))
@@ -700,6 +714,67 @@ func (v *VoiceConnection) onDaveBinaryEvent(message []byte) {
 	default:
 		v.log(LogWarning, "DAVE: unknown binary opcode %d", opcode)
 	}
+}
+
+func (v *VoiceConnection) flushPendingDaveBinary() {
+	v.Lock()
+	pending := v.pendingDaveBinary
+	v.pendingDaveBinary = nil
+	v.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+	pending = prioritizeDaveBinaryMessages(pending)
+	v.log(LogInformational, "replaying %d queued DAVE binary messages", len(pending))
+	for _, message := range pending {
+		v.onDaveBinaryEvent(message)
+	}
+}
+
+func prioritizeDaveBinaryMessages(messages [][]byte) [][]byte {
+	if len(messages) < 2 {
+		return messages
+	}
+	ordered := make([][]byte, 0, len(messages))
+	appendByOpcode := func(target byte) {
+		for _, message := range messages {
+			if detectDaveBinaryOpcode(message) == target {
+				ordered = append(ordered, message)
+			}
+		}
+	}
+	appendByOpcode(dave.BinaryOpcodeExternalSender)
+	appendByOpcode(dave.BinaryOpcodeProposals)
+	appendByOpcode(dave.BinaryOpcodeAnnounceCommit)
+	appendByOpcode(dave.BinaryOpcodeWelcome)
+	appendByOpcode(dave.BinaryOpcodeCommitWelcome)
+	for _, message := range messages {
+		opcode := detectDaveBinaryOpcode(message)
+		switch opcode {
+		case dave.BinaryOpcodeExternalSender,
+			dave.BinaryOpcodeProposals,
+			dave.BinaryOpcodeAnnounceCommit,
+			dave.BinaryOpcodeWelcome,
+			dave.BinaryOpcodeCommitWelcome:
+			continue
+		default:
+			ordered = append(ordered, message)
+		}
+	}
+	return ordered
+}
+
+func detectDaveBinaryOpcode(message []byte) byte {
+	if len(message) < 1 {
+		return 0
+	}
+	if message[0] >= dave.BinaryOpcodeExternalSender && message[0] <= dave.BinaryOpcodeWelcome {
+		return message[0]
+	}
+	if len(message) >= 3 && message[2] >= dave.BinaryOpcodeExternalSender && message[2] <= dave.BinaryOpcodeWelcome {
+		return message[2]
+	}
+	return 0
 }
 
 // sendDaveTransitionReady sends voice opcode 23 (transition ready) to the server.

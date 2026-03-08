@@ -8,12 +8,6 @@ import (
 	"time"
 )
 
-// ProposalsOperationType represents the operation type in binary opcode 27.
-const (
-	ProposalsOpAppend = 0
-	ProposalsOpRevoke = 1
-)
-
 // DAVESession coordinates MLS session management with per-SSRC
 // encrypt/decrypt operations for DAVE E2EE on Discord voice.
 type DAVESession struct {
@@ -198,30 +192,17 @@ func (ds *DAVESession) HandleExternalSender(data []byte) ([]byte, error) {
 }
 
 // HandleProposalsBinary processes binary opcode 27 payload.
-// The payload format is: [ProposalsOperationType (1 byte)][proposals data].
+// Discord voice gateway already sends raw serialized proposal bytes.
 // Returns commit+welcome bytes to send as opcode 28 (if we are the committer), or nil.
 func (ds *DAVESession) HandleProposalsBinary(data []byte) ([]byte, error) {
-	if len(data) < 2 {
+	if len(data) == 0 {
 		return nil, fmt.Errorf("dave: proposals data too short")
-	}
-
-	opType := data[0]
-	proposalsData := data[1:]
-
-	if opType == ProposalsOpRevoke {
-		// Revoke proposals contain proposal references, not full proposals.
-		// For now, we don't process revocations.
-		return nil, nil
-	}
-
-	if opType != ProposalsOpAppend {
-		return nil, fmt.Errorf("dave: unknown proposals operation type %d", opType)
 	}
 
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 
-	commitWelcome, err := ds.mlsSession.ProcessProposals(proposalsData, nil)
+	commitWelcome, err := ds.mlsSession.ProcessProposals(data, nil)
 	if err != nil {
 		return nil, fmt.Errorf("dave: process proposals: %w", err)
 	}
@@ -259,6 +240,9 @@ func (ds *DAVESession) HandleCommitBinary(data []byte) (uint16, error) {
 	}
 	if resultType == CommitOK {
 		ds.prepareReceiverKeys()
+		if transitionID == 0 {
+			ds.activateSenderKeysLocked()
+		}
 	}
 	return transitionID, nil
 }
@@ -286,6 +270,9 @@ func (ds *DAVESession) HandleWelcomeBinary(data []byte) (uint16, error) {
 		return transitionID, fmt.Errorf("dave: process welcome: %w", err)
 	}
 	ds.prepareReceiverKeys()
+	if transitionID == 0 {
+		ds.activateSenderKeysLocked()
+	}
 	return transitionID, nil
 }
 
@@ -299,7 +286,10 @@ type TransitionResult struct {
 func (ds *DAVESession) ActivateSenderKeys() {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
+	ds.activateSenderKeysLocked()
+}
 
+func (ds *DAVESession) activateSenderKeysLocked() {
 	if ds.pendingEncryptorKR != nil {
 		ds.encryptor.SetKeyRatchet(ds.pendingEncryptorKR)
 		ds.encryptor.SetPassthroughMode(false)
