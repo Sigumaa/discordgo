@@ -1161,6 +1161,7 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 	var nonce [12]byte
 	var udpReads int
 	var rtpReads int
+	var rtcpDrops int
 	var nonRTPDrops int
 	var shortHeaderDrops int
 	var shortPayloadDrops int
@@ -1195,8 +1196,8 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			// continue loop
 		}
 
-		// For now, skip anything except RTP v2 packets (audio).
-		// RTP v2 => top two bits are 10 (0x80).
+		// Skip anything except RTP/RTCP v2 packets.
+		// Version 2 => top two bits are 10 (0x80).
 		if rlen < 12 || (recvbuf[0]&0xC0) != 0x80 {
 			nonRTPDrops++
 			if nonRTPDrops <= 3 {
@@ -1204,9 +1205,18 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			}
 			continue
 		}
+
+		// RTCP also uses version 2 but packet types 200-204. Do not treat it as audio RTP.
+		if recvbuf[1] >= 200 && recvbuf[1] <= 204 {
+			rtcpDrops++
+			if rtcpDrops <= 5 {
+				v.log(LogDebug, "voice udp packet skipped: RTCP control (len=%d packet_type=%d udp_reads=%d count=%d)", rlen, recvbuf[1], udpReads, rtcpDrops)
+			}
+			continue
+		}
 		rtpReads++
 		if rtpReads == 1 {
-			v.log(LogInformational, "voice first RTP packet received (%d bytes)", rlen)
+			v.log(LogInformational, "voice first RTP audio packet received (len=%d payload_type=%d)", rlen, recvbuf[1]&0x7F)
 		}
 
 		// build a audio packet struct
