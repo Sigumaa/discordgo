@@ -101,18 +101,6 @@ func TestShouldRetryDaveDecryptInference(t *testing.T) {
 	}
 }
 
-func TestShouldPassthroughDaveDecrypt(t *testing.T) {
-	if !shouldPassthroughDaveDecrypt(assertErr("dave: decrypt failed with code 1"), []byte{1, 2, 3, 4}) {
-		t.Fatal("expected decrypt failure code 1 to allow passthrough for audio frame")
-	}
-	if shouldPassthroughDaveDecrypt(assertErr("dave: decrypt failed with code 1"), []byte{1, 2, 3}) {
-		t.Fatal("expected comfort-noise frame not to passthrough")
-	}
-	if shouldPassthroughDaveDecrypt(assertErr("dave: no decryptor for SSRC 42"), []byte{1, 2, 3, 4}) {
-		t.Fatal("expected missing decryptor to avoid passthrough fallback")
-	}
-}
-
 type assertErr string
 
 func (e assertErr) Error() string {

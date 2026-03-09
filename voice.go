@@ -303,16 +303,6 @@ func shouldRetryDaveDecryptInference(err error) bool {
 	return strings.Contains(err.Error(), "no decryptor for SSRC")
 }
 
-func shouldPassthroughDaveDecrypt(err error, frame []byte) bool {
-	if err == nil {
-		return false
-	}
-	if len(frame) <= 3 {
-		return false
-	}
-	return strings.Contains(err.Error(), "decrypt failed with code 1")
-}
-
 // VoiceSpeakingUpdate is a struct for a VoiceSpeakingUpdate event.
 type VoiceSpeakingUpdate struct {
 	UserID   string `json:"user_id"`
@@ -1389,10 +1379,6 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 						decrypted = inferred
 						daveErr = nil
 					}
-				}
-				if shouldPassthroughDaveDecrypt(daveErr, plain) {
-					decrypted = plain
-					daveErr = nil
 				}
 				if daveErr != nil {
 					daveDecryptDrops++
