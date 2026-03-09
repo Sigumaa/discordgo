@@ -303,6 +303,16 @@ func shouldRetryDaveDecryptInference(err error) bool {
 	return strings.Contains(err.Error(), "no decryptor for SSRC")
 }
 
+func shouldPassthroughDaveDecrypt(err error, frame []byte) bool {
+	if err == nil {
+		return false
+	}
+	if len(frame) <= 3 {
+		return false
+	}
+	return strings.Contains(err.Error(), "decrypt failed with code 1")
+}
+
 // VoiceSpeakingUpdate is a struct for a VoiceSpeakingUpdate event.
 type VoiceSpeakingUpdate struct {
 	UserID   string `json:"user_id"`
@@ -1365,6 +1375,12 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 				}
 			}
 
+			// Discord may emit comfort-noise as tiny plaintext Opus packets.
+			// Do not feed those into DAVE decrypt; they are not useful input.
+			if len(plain) <= 3 {
+				continue
+			}
+
 			// DAVE E2EE: decrypt after transport decryption
 			if v.daveSession != nil {
 				decrypted, daveErr := v.daveSession.DecryptOpusFrame(p.SSRC, plain)
@@ -1373,6 +1389,10 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 						decrypted = inferred
 						daveErr = nil
 					}
+				}
+				if shouldPassthroughDaveDecrypt(daveErr, plain) {
+					decrypted = plain
+					daveErr = nil
 				}
 				if daveErr != nil {
 					daveDecryptDrops++
